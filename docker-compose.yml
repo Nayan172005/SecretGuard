@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:7
+    container_name: secretguard-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: secret-detector
+
+  # Python Detection Engine
+  detection-engine:
+    build:
+      context: ./detection-engine
+      dockerfile: Dockerfile
+    container_name: secretguard-engine
+    ports:
+      - "8000:8000"
+    environment:
+      - DETECTION_ENGINE_PORT=8000
+
+  # Node.js Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: secretguard-backend
+    ports:
+      - "5000:5000"
+    depends_on:
+      - mongodb
+      - detection-engine
+    environment:
+      - PORT=5000
+      - MONGODB_URI=mongodb://mongodb:27017/secret-detector
+      - PYTHON_ENGINE_URL=http://detection-engine:8000
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MAX_UPLOAD_SIZE_MB=100
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: secretguard-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:5000/api
+
+volumes:
+  mongo-data:
