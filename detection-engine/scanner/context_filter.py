@@ -8,6 +8,7 @@ a detection candidate is likely a real secret or a placeholder/example.
 import re
 from typing import List, Set
 from .models import DetectionCandidate
+from .secret_validator import is_environment_variable_usage
 
 
 # Strings that are clearly placeholder/example values
@@ -80,6 +81,14 @@ PLACEHOLDER_VALUES: Set[str] = {
     'todo',
 }
 
+# Additional placeholder substrings that indicate non-real values
+PLACEHOLDER_SUBSTRINGS = [
+    'yourkeyhere', 'yourtokenhere', 'yoursecrethere',
+    'your_key_here', 'your_token_here', 'your_secret_here',
+    'example_token', 'example_key', 'example_secret',
+    'placeholder', 'changeme', 'insertkeyhere',
+]
+
 # Patterns indicating documentation/comment context
 DOCUMENTATION_INDICATORS: List[str] = [
     r'(?i)#\s*example',
@@ -123,6 +132,11 @@ def is_placeholder_value(value: str) -> bool:
         if re.match(pattern, value):
             return True
 
+    # Check placeholder substrings (e.g., "AIzaSyYourKeyHere")
+    for substr in PLACEHOLDER_SUBSTRINGS:
+        if substr in lower_value:
+            return True
+
     # Check repetitive patterns (e.g., "aaaaaaaaaa", "abcabcabc")
     if REPETITIVE_PATTERN.match(value):
         return True
@@ -143,8 +157,17 @@ def is_documentation_context(code_context: str) -> bool:
         if re.search(pattern, code_context):
             return True
 
-    # Check if the matched line is inside a block comment
+    # Check if the matched line itself is a comment with an example
     lines = code_context.split('\n')
+    middle_idx = len(lines) // 2
+    if middle_idx < len(lines):
+        mid_line = lines[middle_idx].strip()
+        # Lines starting with # or // that contain 'Example:' or 'e.g.'
+        if mid_line.startswith('#') or mid_line.startswith('//'):
+            if any(kw in mid_line.lower() for kw in ['example', 'e.g.', 'sample', 'demo']):
+                return True
+
+    # Check if the matched line is inside a block comment
     in_block_comment = False
     for line in lines:
         stripped = line.strip()
@@ -182,6 +205,21 @@ def get_variable_context(line: str) -> str:
     return ""
 
 
+def _get_candidate_line(candidate: DetectionCandidate) -> str:
+    """Locate the actual matched source line inside a candidate context."""
+    if not candidate.code_context:
+        return ""
+
+    lines = candidate.code_context.split('\n')
+    for line in lines:
+        if candidate.value and candidate.value in line:
+            return line
+
+    # Fall back to the previous center-line behavior when the value was
+    # captured separately from the literal text in context.
+    return lines[len(lines) // 2] if lines else ""
+
+
 def filter_candidates(
     candidates: List[DetectionCandidate],
     allow_test_files: bool = False,
@@ -211,6 +249,12 @@ def filter_candidates(
             candidate.confidence *= 0.1
             continue  # Skip known placeholders entirely
 
+        # Check if value comes from environment variable
+        if is_environment_variable_usage(candidate.code_context):
+            candidate.is_false_positive = True
+            candidate.confidence *= 0.05
+            continue  # Environment variables are safe sources
+
         # Check documentation context
         if is_documentation_context(candidate.code_context):
             candidate.confidence *= 0.3
@@ -223,9 +267,8 @@ def filter_candidates(
             candidate.confidence *= 0.5
 
         # Check variable context - boost if variable name is suspicious
-        var_name = get_variable_context(
-            candidate.code_context.split('\n')[len(candidate.code_context.split('\n')) // 2]
-            if candidate.code_context else ""
+        var_name = candidate.context_variable or get_variable_context(
+            _get_candidate_line(candidate)
         )
         if var_name:
             candidate.context_variable = var_name

@@ -15,10 +15,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from scanner.regex_detector import detect_secrets_in_content
 from scanner.entropy_analyzer import analyze_entropy, calculate_shannon_entropy
 from scanner.context_filter import filter_candidates, is_placeholder_value
+from scanner.secret_validator import (
+    is_secret_like,
+    is_environment_variable_usage,
+    validate_reconstructed_secret,
+)
 from scanner.secret_reconstructor import SecretReconstructor
 from scanner.dataflow_tracker import DataflowTracker
 from scanner.sink_analyzer import analyze_propagation_sinks, analyze_code_for_sinks, classify_sink
 from scanner.risk_engine import score_finding, calculate_risk_score
+from scanner.deduplicator import deduplicate_findings
 from scanner.models import (
     Finding, DetectionCandidate, ReconstructionStatus,
     ExposureType, SinkRisk, Severity, mask_secret
@@ -464,6 +470,120 @@ requests.get("https://api.example.com", headers=headers)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+def test_secret_validation_rejects_normal_content():
+    assert not is_secret_like("Hello World", "greeting")
+    assert not is_secret_like("John Doe", "full_name")
+    assert not is_secret_like("https://api.example.com/v1/users", "url")
+    assert not is_secret_like("development", "environment")
+
+
+def test_environment_variable_sources_are_safe():
+    assert is_environment_variable_usage('API_KEY = os.environ.get("API_KEY", "")')
+    assert is_environment_variable_usage('SECRET_KEY = os.getenv("SECRET_KEY")')
+    assert is_environment_variable_usage('const apiKey = process.env.API_KEY')
+    assert not is_secret_like(
+        "AIzaSyDemoTestKey1234567890_abcdef",
+        "API_KEY",
+        'API_KEY = os.environ.get("API_KEY", "")',
+    )
+
+
+def test_secret_validation_accepts_fragmented_secret():
+    is_secret, confidence, secret_type, _ = validate_reconstructed_secret(
+        "AKIATESTFRAGMENT12345678",
+        "access_key",
+        "access_key = part1 + part2 + part3",
+        3,
+    )
+    assert is_secret
+    assert confidence >= 0.45
+    assert "AWS" in secret_type
+
+
+def test_sink_priority_console_log_is_log_output():
+    sink = classify_sink("console.log", "console.log(token)")
+    assert sink is not None
+    assert sink.sink_type == ExposureType.LOG_OUTPUT
+
+
+def test_network_sink_variants():
+    for func_name in ("requests.post", "requests.patch", "httpx.get", "axios.post", "fetch"):
+        sink = classify_sink(func_name, f"{func_name}(url, headers=headers)")
+        assert sink is not None
+        assert sink.sink_type == ExposureType.NETWORK_REQUEST
+
+
+def test_multiple_sinks_from_multiline_python_code():
+    code = '''
+api_key = "test123"
+headers = {
+    "Authorization": api_key
+}
+response = requests.post(
+    "https://example.com",
+    headers=headers
+)
+print(api_key)
+'''
+    sinks = analyze_code_for_sinks(code, "test.py", {"api_key"})
+    sink_types = {s.sink_type for s in sinks}
+    assert ExposureType.AUTH_HEADER in sink_types
+    assert ExposureType.NETWORK_REQUEST in sink_types
+    assert ExposureType.LOG_OUTPUT in sink_types
+
+
+def test_reconstruction_validation_rejects_benign_concatenation():
+    code = '''
+greeting = "Hello" + " " + "World"
+'''
+    reconstructor = SecretReconstructor()
+    reconstructed = reconstructor.analyze_python(code, "test.py")
+    found = [r for r in reconstructed if r["target"] == "greeting"]
+    assert found
+    is_secret, _, _, _ = validate_reconstructed_secret(
+        found[0]["reconstructed_value"],
+        found[0]["target"],
+        code,
+        len(found[0]["fragments"]),
+    )
+    assert not is_secret
+
+
+def test_deduplicates_same_secret_detection_methods():
+    raw_secret = "ghp_TestTokenSynthetic1234567890abcdef"
+    findings = [
+        Finding(
+            secret_type="GitHub Personal Access Token",
+            file_path="app.py",
+            raw_secret=raw_secret,
+            masked_secret=mask_secret(raw_secret),
+            detection_methods=["regex"],
+            confidence=0.9,
+        ),
+        Finding(
+            secret_type="High Entropy String",
+            file_path="app.py",
+            raw_secret=raw_secret,
+            masked_secret=mask_secret(raw_secret),
+            detection_methods=["entropy"],
+            confidence=0.5,
+        ),
+        Finding(
+            secret_type="Reconstructed Secret",
+            file_path="app.py",
+            raw_secret=raw_secret,
+            masked_secret=mask_secret(raw_secret),
+            detection_methods=["reconstruction", "dataflow"],
+            confidence=0.8,
+        ),
+    ]
+    deduped = deduplicate_findings(findings)
+    assert len(deduped) == 1
+    assert set(deduped[0].detection_methods) == {
+        "regex", "entropy", "reconstruction", "dataflow"
+    }
+
+
 # RUN ALL TESTS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -498,6 +618,14 @@ if __name__ == "__main__":
         test_mask_secret,
         test_end_to_end_fragmented_secret,
         test_baseline_vs_proposed,
+        test_secret_validation_rejects_normal_content,
+        test_environment_variable_sources_are_safe,
+        test_secret_validation_accepts_fragmented_secret,
+        test_sink_priority_console_log_is_log_output,
+        test_network_sink_variants,
+        test_multiple_sinks_from_multiline_python_code,
+        test_reconstruction_validation_rejects_benign_concatenation,
+        test_deduplicates_same_secret_detection_methods,
     ]
 
     passed = 0

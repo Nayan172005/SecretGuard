@@ -26,7 +26,7 @@ SECRET_PATTERNS: List[Dict] = [
     },
     {
         "name": "Google API Key",
-        "pattern": r'AIza[0-9A-Za-z\-_]{35}',
+        "pattern": r'AIza[0-9A-Za-z\-_]{10,}',
         "secret_type": "Google API Key",
         "confidence": 0.9,
     },
@@ -147,6 +147,31 @@ SECRET_PATTERNS: List[Dict] = [
 ]
 
 
+def _extract_assignment_variable(line: str) -> str:
+    """Return the variable assigned on a simple source-code line."""
+    match = re.match(
+        r'\s*(?:(?:const|let|var|export|final|static)\s+)?'
+        r'([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?[=:]',
+        line,
+    )
+    return match.group(1) if match else ""
+
+
+def _classify_matched_value(value: str, default_type: str) -> str:
+    """Prefer concrete provider signatures over generic assignment patterns."""
+    if value.startswith("AIza"):
+        return "Google API Key"
+    if value.startswith("ghp_"):
+        return "GitHub Personal Access Token"
+    if value.startswith("github_pat_"):
+        return "GitHub Fine-grained Token"
+    if value.startswith("sk_live_"):
+        return "Stripe Secret Key"
+    if value.startswith(("AKIA", "ASIA", "AIDA", "AROA")):
+        return "AWS Access Key"
+    return default_type
+
+
 def detect_secrets_in_content(
     content: str,
     file_path: str,
@@ -190,9 +215,12 @@ def detect_secrets_in_content(
                     file_path=file_path,
                     line_number=line_idx + 1,  # 1-indexed
                     column=match.start() + 1,
-                    secret_type=pattern_def["secret_type"],
+                    secret_type=_classify_matched_value(
+                        matched_value, pattern_def["secret_type"]
+                    ),
                     detection_method="regex",
                     confidence=pattern_def["confidence"],
+                    context_variable=_extract_assignment_variable(line),
                     code_context=code_context,
                 )
 

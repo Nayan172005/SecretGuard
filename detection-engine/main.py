@@ -10,9 +10,10 @@ orchestrates the complete analysis pipeline:
 3. Entropy analysis
 4. Context filtering
 5. Secret reconstruction (CORE NOVELTY)
-6. Dataflow tracking (CORE NOVELTY)
-7. Exposure sink analysis (CORE NOVELTY)
-8. Risk scoring
+6. Secret validation (post-reconstruction filtering)
+7. Dataflow tracking (CORE NOVELTY)
+8. Exposure sink analysis (CORE NOVELTY)
+9. Risk scoring
 
 The engine runs as a standalone HTTP service and communicates
 with the Node.js backend via REST.
@@ -23,7 +24,7 @@ import sys
 import json
 import time
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,10 +38,12 @@ from scanner.secret_reconstructor import SecretReconstructor
 from scanner.dataflow_tracker import DataflowTracker
 from scanner.sink_analyzer import analyze_propagation_sinks, analyze_code_for_sinks
 from scanner.risk_engine import score_finding
+from scanner.secret_validator import validate_reconstructed_secret, is_environment_variable_usage
+from scanner.deduplicator import deduplicate_findings
 from scanner.models import (
     Finding, ScanResult, DetectionCandidate,
     ReconstructionStatus, mask_secret,
-    PropagationGraph, ExposureSink
+    PropagationGraph, ExposureSink, ExposureType
 )
 
 # ─── Logging Setup ────────────────────────────────────────────────────────
@@ -168,9 +171,11 @@ def perform_scan(
     3. Entropy analysis
     4. Context filtering
     5. Secret reconstruction
-    6. Dataflow tracking
-    7. Sink analysis
-    8. Risk scoring
+    6. Secret validation (post-reconstruction)
+    7. Dataflow tracking
+    8. Sink analysis
+    9. Risk scoring
+    10. Finding deduplication
     """
     result = ScanResult(repository_name=repo_name)
     if scan_id:
@@ -229,35 +234,67 @@ def perform_scan(
             logger.warning(f"Reconstruction error in {f.relative_path}: {e}")
             continue
 
-    logger.info(f"Reconstructed {len(all_reconstructed)} secrets from fragments")
-    result.secrets_reconstructed = len(all_reconstructed)
+    logger.info(f"Reconstructed {len(all_reconstructed)} candidates from fragments")
 
-    # ── Step 6: Dataflow tracking (CORE NOVELTY) ────────────────────
-    logger.info("Phase 6: Tracking dataflow propagation...")
+    # ── Step 6: Secret validation (post-reconstruction) ──────────────
+    logger.info("Phase 6: Validating reconstructed candidates...")
+    validated_reconstructed = []
+    for recon in all_reconstructed:
+        # Get code context for validation
+        code_context = ""
+        for f in files:
+            if f.relative_path == recon["file"]:
+                ctx_start = max(0, recon["line"] - 4)
+                ctx_end = min(len(f.lines), recon["line"] + 3)
+                code_context = '\n'.join(f.lines[ctx_start:ctx_end])
+                break
+
+        is_secret, confidence, secret_type, reason = validate_reconstructed_secret(
+            recon["reconstructed_value"],
+            recon["target"],
+            code_context,
+            len(recon["fragments"]),
+        )
+
+        if is_secret:
+            recon["_validated_confidence"] = confidence
+            recon["_validated_secret_type"] = secret_type
+            recon["_validated_reason"] = reason
+            validated_reconstructed.append(recon)
+            logger.info(f"  ✓ Validated: {recon['target']} → {secret_type} (confidence={confidence:.2f})")
+        else:
+            logger.info(f"  ✗ Rejected: {recon['target']} → {reason}")
+
+    result.secrets_reconstructed = len(validated_reconstructed)
+    logger.info(f"After validation: {len(validated_reconstructed)} confirmed secret reconstructions")
+
+    # ── Step 7: Dataflow tracking (CORE NOVELTY) ────────────────────
+    logger.info("Phase 7: Tracking dataflow propagation...")
     tracker = DataflowTracker()
-    all_propagation_graphs = {}
+    all_propagation_graphs: Dict[str, PropagationGraph] = {}
 
     for f in files:
-        # Build secret variables from reconstructor's symbol table
-        reconstructor_instance = SecretReconstructor()
-        reconstructor_instance.analyze_generic(f.content, f.relative_path, f.language)
-        symbol_table = reconstructor_instance.get_symbol_table()
+        # Build secret variables from ALL confirmed sources:
+        # - Validated reconstructions
+        # - Direct regex/entropy detections
+        secret_vars: Dict[str, Tuple[str, int]] = {}
 
-        # Get variables that were part of reconstruction
-        secret_vars = {}
-        for recon in all_reconstructed:
+        # From validated reconstructions
+        for recon in validated_reconstructed:
             if recon["file"] == f.relative_path:
                 target = recon["target"]
                 value = recon["reconstructed_value"]
                 line = recon["line"]
                 secret_vars[target] = (value, line)
 
-        # Also include direct regex hits as tracked variables
+        # From direct regex/entropy hits — allow confirmed secrets to enter dataflow
         for candidate in filtered_candidates:
             if candidate.file_path == f.relative_path and candidate.context_variable:
-                secret_vars[candidate.context_variable] = (
-                    candidate.value, candidate.line_number
-                )
+                # Skip environment variable sourced candidates
+                if not is_environment_variable_usage(candidate.code_context):
+                    secret_vars[candidate.context_variable] = (
+                        candidate.value, candidate.line_number
+                    )
 
         if secret_vars:
             try:
@@ -270,22 +307,17 @@ def perform_scan(
             except Exception as e:
                 logger.warning(f"Dataflow tracking error in {f.relative_path}: {e}")
 
-    # ── Step 7: Sink analysis (CORE NOVELTY) ─────────────────────────
-    logger.info("Phase 7: Analyzing exposure sinks...")
+    # ── Step 8: Sink analysis (CORE NOVELTY) ─────────────────────────
+    logger.info("Phase 8: Analyzing exposure sinks...")
 
-    # ── Step 8: Build findings and score ─────────────────────────────
-    logger.info("Phase 8: Scoring findings...")
+    # ── Step 9: Build findings and score ─────────────────────────────
+    logger.info("Phase 9: Building and scoring findings...")
 
-    # Create findings from direct regex/entropy detections
-    findings: List[Finding] = []
-    seen_locations = set()
+    # We'll collect all findings and then deduplicate
+    raw_findings: List[Finding] = []
 
+    # ── Create findings from direct regex/entropy detections ────────
     for candidate in filtered_candidates:
-        loc_key = f"{candidate.file_path}:{candidate.line_number}:{candidate.value[:10]}"
-        if loc_key in seen_locations:
-            continue
-        seen_locations.add(loc_key)
-
         finding = Finding(
             secret_type=candidate.secret_type,
             file_path=candidate.file_path,
@@ -298,7 +330,7 @@ def perform_scan(
             entropy_score=candidate.entropy_score,
         )
 
-        # Check if this candidate has a propagation graph
+        # Attach propagation graph if available
         graph_key = f"{candidate.file_path}:{candidate.context_variable}"
         if graph_key in all_propagation_graphs:
             graph = all_propagation_graphs[graph_key]
@@ -308,32 +340,51 @@ def perform_scan(
             # Analyze sinks from propagation
             sinks = analyze_propagation_sinks(graph, candidate.file_path)
             if sinks:
-                finding.exposure_sink = sinks[0]  # Primary sink
-                finding.exposure_type = sinks[0].sink_type.value
+                finding.exposure_sink = _select_best_sink(sinks)
+                finding.exposure_type = finding.exposure_sink.sink_type.value
 
-        finding = score_finding(finding)
-        findings.append(finding)
+        # Also do direct code sink analysis for this variable
+        if candidate.context_variable:
+            for f in files:
+                if f.relative_path == candidate.file_path:
+                    direct_sinks = analyze_code_for_sinks(
+                        f.content, f.relative_path, {candidate.context_variable}
+                    )
+                    if direct_sinks and not finding.exposure_sink:
+                        finding.exposure_sink = _select_best_sink(direct_sinks)
+                        finding.exposure_type = finding.exposure_sink.sink_type.value
+                    elif direct_sinks and finding.exposure_sink:
+                        finding.exposure_sink = _select_best_sink(
+                            direct_sinks + [finding.exposure_sink]
+                        )
+                        finding.exposure_type = finding.exposure_sink.sink_type.value
+                    break
 
-    # Create findings from reconstructed secrets
-    for recon in all_reconstructed:
-        loc_key = f"{recon['file']}:{recon['line']}:recon"
-        if loc_key in seen_locations:
-            continue
-        seen_locations.add(loc_key)
+        raw_findings.append(finding)
 
+    # ── Create findings from validated reconstructed secrets ────────
+    for recon in validated_reconstructed:
         reconstructed_value = recon["reconstructed_value"]
+        secret_type = recon.get("_validated_secret_type", "Reconstructed Secret")
 
-        # Detect what type of secret this might be
-        secret_type = _classify_reconstructed_secret(reconstructed_value)
+        # Determine code context
+        code_context = ""
+        for f in files:
+            if f.relative_path == recon["file"]:
+                ctx_start = max(0, recon["line"] - 4)
+                ctx_end = min(len(f.lines), recon["line"] + 3)
+                code_context = '\n'.join(f.lines[ctx_start:ctx_end])
+                break
 
         finding = Finding(
             secret_type=secret_type,
             file_path=recon["file"],
             line_number=recon["line"],
+            code_context=code_context,
             masked_secret=mask_secret(reconstructed_value),
             raw_secret=reconstructed_value,
             detection_methods=["reconstruction", "dataflow"],
-            confidence=0.8 if recon["status"] == ReconstructionStatus.FULL else 0.5,
+            confidence=recon.get("_validated_confidence", 0.5),
             reconstruction_status=recon["status"],
             fragments=recon["fragments"],
             reconstructed_value_masked=mask_secret(reconstructed_value),
@@ -348,8 +399,8 @@ def perform_scan(
 
             sinks = analyze_propagation_sinks(graph, recon["file"])
             if sinks:
-                finding.exposure_sink = sinks[0]
-                finding.exposure_type = sinks[0].sink_type.value
+                finding.exposure_sink = _select_best_sink(sinks)
+                finding.exposure_type = finding.exposure_sink.sink_type.value
 
         # Also do direct code sink analysis
         for f in files:
@@ -358,26 +409,25 @@ def perform_scan(
                     f.content, f.relative_path, {recon["target"]}
                 )
                 if direct_sinks and not finding.exposure_sink:
-                    finding.exposure_sink = direct_sinks[0]
-                    finding.exposure_type = direct_sinks[0].sink_type.value
+                    finding.exposure_sink = _select_best_sink(direct_sinks)
+                    finding.exposure_type = finding.exposure_sink.sink_type.value
                 elif direct_sinks and finding.exposure_sink:
-                    # Use the highest risk sink
-                    for sink in direct_sinks:
-                        if sink.risk_level.value == "HIGH":
-                            finding.exposure_sink = sink
-                            finding.exposure_type = sink.sink_type.value
-                            break
-
-        # Build code context for the reconstruction
-        for f in files:
-            if f.relative_path == recon["file"]:
-                ctx_start = max(0, recon["line"] - 4)
-                ctx_end = min(len(f.lines), recon["line"] + 3)
-                finding.code_context = '\n'.join(f.lines[ctx_start:ctx_end])
+                    finding.exposure_sink = _select_best_sink(
+                        direct_sinks + [finding.exposure_sink]
+                    )
+                    finding.exposure_type = finding.exposure_sink.sink_type.value
                 break
 
-        finding = score_finding(finding)
-        findings.append(finding)
+        raw_findings.append(finding)
+
+    # ── Step 10: Deduplicate findings ────────────────────────────────
+    logger.info("Phase 10: Deduplicating findings...")
+    findings = deduplicate_findings(raw_findings)
+    logger.info(f"After deduplication: {len(findings)} unique findings (from {len(raw_findings)})")
+
+    # Score all findings
+    for i, finding in enumerate(findings):
+        findings[i] = score_finding(finding)
 
     # Sort findings by risk score (highest first)
     findings.sort(key=lambda f: f.risk_score, reverse=True)
@@ -394,6 +444,37 @@ def perform_scan(
         result.average_risk_score = sum(f.risk_score for f in findings) / len(findings)
 
     return result
+
+
+def _select_best_sink(sinks: List[ExposureSink]) -> ExposureSink:
+    """Pick the most security-relevant exposure when multiple sinks exist."""
+    priority = {
+        ExposureType.NETWORK_REQUEST: 5,
+        ExposureType.AUTH_HEADER: 4,
+        ExposureType.API_CALL: 4,
+        ExposureType.DATABASE: 3,
+        ExposureType.FILE_WRITE: 2,
+        ExposureType.LOG_OUTPUT: 1,
+        ExposureType.CONSOLE_OUTPUT: 1,
+        ExposureType.CONFIG_PROPAGATION: 1,
+        ExposureType.UNKNOWN: 0,
+    }
+    return max(sinks, key=lambda sink: priority.get(sink.sink_type, 0))
+
+
+def _deduplicate_findings(raw_findings: List[Finding]) -> List[Finding]:
+    """Compatibility wrapper for the scanner-level deduplication helper."""
+    return deduplicate_findings(raw_findings)
+
+
+def _get_finding_dedup_key(finding: Finding) -> str:
+    """
+    Generate a stable deduplication key for a finding.
+    Secrets at the same location with the same value should merge.
+    """
+    # Use the raw secret's first 12 chars + file for identity
+    secret_sig = finding.raw_secret[:12] if finding.raw_secret else finding.masked_secret[:12]
+    return f"{finding.file_path}:{secret_sig}"
 
 
 def perform_baseline_scan(
@@ -470,7 +551,7 @@ def _classify_reconstructed_secret(value: str) -> str:
 
     if re.match(r'^AKIA[A-Z0-9]{16}', value):
         return "AWS Access Key"
-    if re.match(r'^AIza[0-9A-Za-z\-_]{35}', value):
+    if re.match(r'^AIza[0-9A-Za-z\-_]{20,}', value):
         return "Google API Key"
     if re.match(r'^ghp_[0-9a-zA-Z]{36}', value):
         return "GitHub Personal Access Token"

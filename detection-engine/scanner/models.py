@@ -301,6 +301,8 @@ def mask_secret(secret: str, visible_chars: int = 4) -> str:
     Mask a secret value, showing only the first and last few characters.
     Example: "AKIATEST1234ABCDE" -> "AKIA**********CDE"
     """
-    if not secret or len(secret) <= visible_chars * 2:
-        return "*" * max(len(secret), 4)
+    if not secret:
+        return ""
+    if len(secret) <= visible_chars * 2:
+        return "*" * len(secret)
     return secret[:visible_chars] + "*" * (len(secret) - visible_chars * 2) + secret[-visible_chars:]

@@ -118,6 +118,8 @@ class DataflowTracker:
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 assignments.append(node)
+                if isinstance(node.value, ast.Call):
+                    assignments.append(node.value)
             elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
                 assignments.append(node)
 
@@ -127,6 +129,10 @@ class DataflowTracker:
         for node in assignments:
             if isinstance(node, ast.Assign):
                 self._handle_assignment_propagation(
+                    node, tainted_vars, graph, file_path, lines
+                )
+            elif isinstance(node, ast.Call):
+                self._handle_call_propagation(
                     node, tainted_vars, graph, file_path, lines
                 )
             elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
@@ -170,7 +176,7 @@ class DataflowTracker:
         # Case 2: Dictionary assignment: headers = {"Authorization": tainted_var}
         if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
             for key, val in zip(value.keys, value.values):
-                if isinstance(val, ast.Name) and val.id in tainted_vars:
+                if self._expr_references_tainted(val, tainted_vars):
                     key_name = ""
                     if isinstance(key, ast.Constant):
                         key_name = str(key.value)
@@ -184,7 +190,7 @@ class DataflowTracker:
                         code_snippet=line_code,
                     ))
                     graph.add_edge(PropagationEdge(
-                        source_variable=val.id,
+                        source_variable=self._first_tainted_name(val, tainted_vars) or target.id,
                         target_variable=dict_entry,
                         edge_type="dict_insertion",
                     ))
@@ -215,11 +221,9 @@ class DataflowTracker:
         # Case 4: Concatenation involving tainted var
         if isinstance(target, ast.Name) and isinstance(value, ast.BinOp):
             if isinstance(value.op, ast.Add):
-                left_tainted = (isinstance(value.left, ast.Name) and value.left.id in tainted_vars)
-                right_tainted = (isinstance(value.right, ast.Name) and value.right.id in tainted_vars)
-                if left_tainted or right_tainted:
+                if self._expr_references_tainted(value, tainted_vars):
                     tainted_vars.add(target.id)
-                    source = value.left.id if left_tainted else value.right.id
+                    source = self._first_tainted_name(value, tainted_vars) or target.id
                     graph.add_node(PropagationNode(
                         variable=target.id,
                         file_path=file_path,
@@ -246,35 +250,37 @@ class DataflowTracker:
 
         # Check if any argument is tainted
         for arg in node.args:
-            if isinstance(arg, ast.Name) and arg.id in tainted_vars:
+            if self._expr_references_tainted(arg, tainted_vars):
                 func_name = self._get_func_name(node.func)
+                source = self._first_tainted_name(arg, tainted_vars) or "[expr]"
                 graph.add_node(PropagationNode(
-                    variable=f"{func_name}({arg.id})",
+                    variable=f"{func_name}({source})",
                     file_path=file_path,
                     line_number=node.lineno,
                     operation="function_argument",
                     code_snippet=line_code,
                 ))
                 graph.add_edge(PropagationEdge(
-                    source_variable=arg.id,
+                    source_variable=source,
                     target_variable=f"{func_name}()",
                     edge_type="parameter_pass",
                 ))
 
         # Check keyword arguments
         for kw in node.keywords:
-            if isinstance(kw.value, ast.Name) and kw.value.id in tainted_vars:
+            if kw.value is not None and self._expr_references_tainted(kw.value, tainted_vars):
                 func_name = self._get_func_name(node.func)
                 kw_name = kw.arg or "**kwargs"
+                source = self._first_tainted_name(kw.value, tainted_vars) or "[expr]"
                 graph.add_node(PropagationNode(
-                    variable=f"{func_name}({kw_name}={kw.value.id})",
+                    variable=f"{func_name}({kw_name}={source})",
                     file_path=file_path,
                     line_number=node.lineno,
                     operation="keyword_argument",
                     code_snippet=line_code,
                 ))
                 graph.add_edge(PropagationEdge(
-                    source_variable=kw.value.id,
+                    source_variable=source,
                     target_variable=f"{func_name}({kw_name}=)",
                     edge_type="parameter_pass",
                 ))
@@ -290,6 +296,24 @@ class DataflowTracker:
                 return f"...{node.attr}"
             return node.attr
         return "[function]"
+
+    def _expr_references_tainted(self, node: ast.AST, tainted_vars: Set[str]) -> bool:
+        """Check whether an AST expression references a tainted variable."""
+        if node is None:
+            return False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and child.id in tainted_vars:
+                return True
+        return False
+
+    def _first_tainted_name(self, node: ast.AST, tainted_vars: Set[str]) -> Optional[str]:
+        """Return the first tainted variable referenced by an expression."""
+        if node is None:
+            return None
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and child.id in tainted_vars:
+                return child.id
+        return None
 
     def _track_with_regex(
         self,
