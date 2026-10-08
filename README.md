@@ -33,7 +33,7 @@ SecretGuard addresses two core gaps:
 
 The platform is organized into three decoupled computing tiers and a post-detection advisory service.
 
-![SecretGuard Architecture](docs/fig1_architecture.png)
+![SecretGuard Architecture](docs/Layered-Code-Scanning-Architecture-Diagram.png)
 
 * **Client Tier (React 18 + Vite):** Interactive dashboard providing real-time scan progress, finding matrices, AST propagation graphs, risk score breakdowns, and PDF report downloads.
 * **Orchestration Gateway (Node.js + Express):** Ingestion controller with Zip-Slip path-traversal guards, REST API dispatch, and task coordination.
@@ -46,7 +46,7 @@ The platform is organized into three decoupled computing tiers and a post-detect
 
 The detection engine executes an 8-stage sequential pipeline. Candidate extraction is local and deterministic.
 
-![Detection Pipeline](docs/fig3_detection_pipeline.png)
+![Detection Pipeline](docs/Detection-Pipeline.png)
 
 1. **File Scanner:** Recursively discovers files across 25+ language extensions. Filters binary files (null-byte inspection), minified files (line length > 500 characters), files exceeding 1 MB, and vendor directories (`node_modules`, `.git`, `venv`, `dist`).
 2. **Regex Detector:** Pattern-matching engine with 20+ specialized credential expressions (AWS, Google Cloud, GitHub, Slack, Stripe, SendGrid, Twilio, JWTs, private keys, database URIs).
@@ -57,7 +57,7 @@ The detection engine executes an 8-stage sequential pipeline. Candidate extracti
 7. **Dataflow Tracker:** Performs intra-procedural taint analysis across variable assignments, collection/dictionary subscript insertions (`headers['Authorization'] = key`), and function arguments, outputting a directed acyclic propagation graph (DAG).
 8. **Sink Analyzer & Risk Engine:** Maps terminal graph nodes to a prioritized exposure sink taxonomy and calculates an explainable composite risk score.
 
-![Reconstruction and Exposure Workflow](docs/fig2_reconstruction_workflow.png)
+![Reconstruction and Exposure Workflow](docs/Five-Stage-Secret-Detection-Workflow.png)
 
 ---
 
@@ -92,7 +92,7 @@ Risk Score (0-100) = Detection Confidence (0-25)
 
 The engine was evaluated through automated test suites and three benchmark repository archetypes.
 
-![SecretGuard Dashboard](docs/fig4_frontend_dashboard.png)
+![SecretGuard Dashboard](docs/Frontend-Dashboard.png)
 
 ### Automated Test Suite Coverage
 
