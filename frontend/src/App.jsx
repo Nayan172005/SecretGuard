@@ -18,7 +18,7 @@ function App() {
         {/* Sidebar */}
         <nav className="sidebar">
           <div className="sidebar-brand">
-            <div className="brand-icon">🛡️</div>
+            {/* <div className="brand-icon"></div> */}
             <div>
               <h1>SecretGuard</h1>
               <div className="brand-subtitle">Source Code Scanner</div>
@@ -27,15 +27,15 @@ function App() {
 
           <div className="sidebar-nav">
             <NavLink to="/" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`} end>
-              <span className="nav-icon">📊</span>
+              <span className="nav-icon"></span>
               Dashboard
             </NavLink>
             <NavLink to="/scan" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              <span className="nav-icon">🔍</span>
+              <span className="nav-icon"></span>
               New Scan
             </NavLink>
             <NavLink to="/history" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-              <span className="nav-icon">📋</span>
+              <span className="nav-icon"></span>
               Scan History
             </NavLink>
           </div>

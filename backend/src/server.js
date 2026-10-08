@@ -71,11 +71,11 @@ async function start() {
   await connectDB();
 
   app.listen(PORT, () => {
-    console.log(`\n🔒 Secret Detector Backend running on port ${PORT}`);
+    console.log(`\n Secret Detector Backend running on port ${PORT}`);
     console.log(`   API: http://localhost:${PORT}/api`);
     console.log(`   Health: http://localhost:${PORT}/api/health`);
     console.log(`   Python Engine: ${process.env.PYTHON_ENGINE_URL || 'http://localhost:8000'}`);
-    console.log(`   Gemini: ${process.env.GEMINI_API_KEY ? 'Configured ✓' : 'Not configured (AI analysis unavailable)'}`);
+    console.log(`   Gemini: ${process.env.GEMINI_API_KEY ? 'Configured ' : 'Not configured (AI analysis unavailable)'}`);
     console.log('');
   });
 }
@@ -84,7 +84,7 @@ start().catch(err => {
   console.error('Failed to start server:', err);
   // Start anyway even if DB connection fails
   app.listen(PORT, () => {
-    console.log(`🔒 Server running on port ${PORT} (DB unavailable, using in-memory mode)`);
+    console.log(` Server running on port ${PORT} (DB unavailable, using in-memory mode)`);
   });
 });
 

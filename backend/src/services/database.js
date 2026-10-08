@@ -30,9 +30,9 @@ async function connectDB() {
       serverSelectionTimeoutMS: 5000,
     });
     isConnected = true;
-    console.log('✅ Connected to MongoDB');
+    console.log(' Connected to MongoDB');
   } catch (err) {
-    console.log('⚠️  MongoDB unavailable — using in-memory storage');
+    console.log('  MongoDB unavailable — using in-memory storage');
     console.log(`   Reason: ${err.message}`);
     useInMemory = true;
   }

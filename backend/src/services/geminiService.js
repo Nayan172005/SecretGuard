@@ -22,7 +22,7 @@ let model = null;
 
 function initGemini() {
   if (!process.env.GEMINI_API_KEY) {
-    console.log('⚠️  GEMINI_API_KEY not set — AI analysis unavailable');
+    console.log('  GEMINI_API_KEY not set — AI analysis unavailable');
     return false;
   }
   try {

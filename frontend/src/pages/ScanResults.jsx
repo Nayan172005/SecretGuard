@@ -137,13 +137,13 @@ export default function ScanResults() {
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <a href={getReportUrl(scanId)} target="_blank" rel="noopener" className="btn btn-primary" style={{ justifyContent: 'center' }}>
-              📄 Download PDF Report
+               Download PDF Report
             </a>
             <button className="btn btn-secondary" onClick={() => navigate('/scan')}>
-              🔍 New Scan
+               New Scan
             </button>
             <button className="btn btn-secondary" onClick={() => navigate('/')}>
-              📊 Dashboard
+               Dashboard
             </button>
           </div>
         </div>

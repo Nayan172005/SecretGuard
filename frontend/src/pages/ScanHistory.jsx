@@ -37,7 +37,7 @@ export default function ScanHistory() {
         <div className="card-header">
           <span className="card-title">Scans ({scans.length})</span>
           <button className="btn btn-primary" onClick={() => navigate('/scan')}>
-            🔍 New Scan
+             New Scan
           </button>
         </div>
 
@@ -96,7 +96,7 @@ export default function ScanHistory() {
           </table>
         ) : (
           <div className="empty-state">
-            <div className="empty-icon">📋</div>
+            <div className="empty-icon"></div>
             <h3>No scan history</h3>
             <p>Start your first scan to see results here.</p>
           </div>

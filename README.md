@@ -1,250 +1,324 @@
-# AI-Based Source Code Secret Detector
+# SecretGuard
 
-## Program-Flow-Aware Secret Reconstruction and Exposure Analysis
+Program-Flow-Aware Source Code Secret Detection with Fragmented Secret Reconstruction and Exposure Analysis.
 
-A web-based security scanner that analyzes uploaded source-code repositories to detect hardcoded secrets and credentials, with a novel mechanism for detecting **fragmented secrets** constructed from multiple code fragments.
+SecretGuard is a static application security testing (SAST) system that detects hardcoded secrets in source-code repositories. Beyond standard literal matching, it identifies credentials assembled from multiple source fragments, traces their intra-procedural propagation via taint analysis, classifies operational exposure sinks, and calculates an explainable multi-component risk score.
 
 ---
 
-## 🎯 Problem Statement
+## Problem Overview
 
-Existing secret detection tools primarily rely on regex pattern matching and entropy analysis. While effective for directly hardcoded secrets like `API_KEY = "AIza..."`, they fail to detect secrets that are **constructed from multiple fragments** in the source code:
+Standard secret scanners rely on static regular expressions and Shannon entropy heuristics. While effective for monolithic literal tokens, they fail when credentials are split across multiple programmatic statements or variable assignments:
 
 ```python
 part1 = "AKIA"
-part2 = "TEST1234"
-part3 = "DEMO5678"
-access_key = part1 + part2 + part3  # Invisible to traditional scanners
+part2 = "TESTFRAG"
+part3 = "MENT12345678"
+
+# Invisible to literal pattern matching; individual fragments lack secret format and entropy
+access_key = part1 + part2 + part3
+
+# Uncontextualized scanners do not track whether the secret reaches an external sink
 headers = {"Authorization": access_key}
-requests.get("https://api.example.com", headers=headers)
+requests.get("https://api.cloud.com/data", headers=headers)
 ```
 
-## 🔬 Novelty: Program-Flow-Aware Secret Reconstruction
-
-This project's **primary novelty** is:
-
-**Program-Flow-Aware Secret Reconstruction and Exposure Analysis**
-
-The system goes beyond traditional pattern matching by:
-
-1. **Fragment Detection** — Identifying string fragments that may constitute parts of a secret
-2. **Secret Reconstruction** — Statically assembling the complete secret from fragments via constant propagation and string concatenation analysis
-3. **Program-Flow Propagation** — Tracking how the reconstructed secret flows through variables using taint analysis
-4. **Exposure Sink Identification** — Determining where the secret eventually reaches (HTTP requests, auth headers, logging, etc.)
-
-This mechanism detects secrets that are **invisible to baseline regex + entropy approaches**.
+SecretGuard addresses two core gaps:
+1. **Fragmented Assembly:** Statically reconstructing secrets assembled across variables, concatenations, string formatting (f-strings), list joins, and static Base64 decoding.
+2. **Exposure Context:** Tracing dataflow propagation to determine whether a secret terminates locally or reaches an outbound operational sink (network request, authorization header, database write, or log stream).
 
 ---
 
-## 🏗️ Architecture
+## System Architecture
+
+The platform is organized into three decoupled computing tiers and a post-detection advisory service.
+
+![SecretGuard Architecture](docs/fig1_architecture.png)
+
+* **Client Tier (React 18 + Vite):** Interactive dashboard providing real-time scan progress, finding matrices, AST propagation graphs, risk score breakdowns, and PDF report downloads.
+* **Orchestration Gateway (Node.js + Express):** Ingestion controller with Zip-Slip path-traversal guards, REST API dispatch, and task coordination.
+* **Analysis Engine (Python 3 + FastAPI):** Autonomous 8-stage static analysis engine executing deterministic AST parsing, taint tracking, and risk calculation.
+* **Advisory Layer (Google Gemini API):** Downstream generative service that receives sanitized, masked finding summaries to generate contextual remediation recommendations without exposing raw repository code.
+
+---
+
+## Detection and Analysis Pipeline
+
+The detection engine executes an 8-stage sequential pipeline. Candidate extraction is local and deterministic.
+
+![Detection Pipeline](docs/fig3_detection_pipeline.png)
+
+1. **File Scanner:** Recursively discovers files across 25+ language extensions. Filters binary files (null-byte inspection), minified files (line length > 500 characters), files exceeding 1 MB, and vendor directories (`node_modules`, `.git`, `venv`, `dist`).
+2. **Regex Detector:** Pattern-matching engine with 20+ specialized credential expressions (AWS, Google Cloud, GitHub, Slack, Stripe, SendGrid, Twilio, JWTs, private keys, database URIs).
+3. **Entropy Analyzer:** Evaluates character randomness using Shannon entropy with type-aware adaptive thresholds (Hexadecimal > 3.0, Base64 > 4.0, General ASCII > 4.5).
+4. **Context Filter:** Suppresses false positives using a dummy placeholder blacklist (`your_api_key_here`, `xxxxxx`), test-suite markers, comment/docstring detectors, and character repetition checks.
+5. **Secret Reconstructor:** Parses Python AST (and applies grammar-based parsing for JavaScript/TypeScript) to build an intra-procedural constant symbol table. Resolves binary additions (`+`), f-strings, `.format()` expressions, list joins, and static `base64.b64decode()` calls. Emits explicit reconstruction statuses (`FULL`, `PARTIAL`, `UNRESOLVED`).
+6. **Pre-Finding Validator:** Enforces length (>= 12 characters) and Shannon entropy (>= 3.2) filters to discard benign string concatenations. Recognizes system configuration retrieval APIs (`os.environ.get`, `os.getenv`, `process.env`) as externalized configuration and excludes them from hardcoded-secret alerts.
+7. **Dataflow Tracker:** Performs intra-procedural taint analysis across variable assignments, collection/dictionary subscript insertions (`headers['Authorization'] = key`), and function arguments, outputting a directed acyclic propagation graph (DAG).
+8. **Sink Analyzer & Risk Engine:** Maps terminal graph nodes to a prioritized exposure sink taxonomy and calculates an explainable composite risk score.
+
+![Reconstruction and Exposure Workflow](docs/fig2_reconstruction_workflow.png)
+
+---
+
+## Risk Scoring Model
+
+Each finding is evaluated using a continuous, transparent 0–100 score composed of four orthogonal 25-point sub-scores:
 
 ```
-                    ┌──────────────────────┐
-                    │     React Frontend   │
-                    │ (Vite + Recharts)    │
-                    └──────────┬───────────┘
-                               │ REST API
-                    ┌──────────▼───────────┐
-                    │ Node.js + Express    │
-                    │ Backend              │
-                    └──────────┬───────────┘
-                               │ Internal HTTP
-                    ┌──────────▼───────────┐
-                    │ Python Detection     │
-                    │ Engine (FastAPI)     │
-                    └──────────┬───────────┘
-                               │ Verified findings
-                    ┌──────────▼───────────┐
-                    │ Gemini AI (optional) │
-                    └──────────────────────┘
+Risk Score (0-100) = Detection Confidence (0-25)
+                   + Secret Sensitivity (0-25)
+                   + Exposure Severity (0-25)
+                   + Propagation Certainty (0-25)
 ```
 
-## 📁 Project Structure
+| Component | Range | Scoring Logic |
+| :--- | :--- | :--- |
+| **Detection Confidence** | 0–25 | Scaled from pattern confidence; +3 to +5 bonus for multi-method detection; +2 bonus for high Shannon entropy (> 4.5). |
+| **Secret Sensitivity** | 0–25 | Calibrated by credential type: AWS Secret / Stripe / Private Key = 25; AWS Access Key = 24; Database URI / GitHub PAT = 23; Google Key / JWT = 22; Generic = 15; UUID = 8. |
+| **Exposure Severity** | 0–25 | Calibrated by sink hazard: Network Request = 25; Auth Header = 24; API Call = 23; Database = 15; File Write = 14; Config = 12; Log = 10; Unexposed = 3. |
+| **Propagation Certainty** | 0–25 | Base score = 5; +10 bonus for `FULL` reconstruction; +5 bonus for `PARTIAL` reconstruction; path length bonus = `min(10, path_length * 2)`. |
+
+### Severity Thresholds
+
+* **Critical:** 80 – 100
+* **High:** 60 – 79
+* **Medium:** 30 – 59
+* **Low:** 0 – 29
+
+---
+
+## Experimental Results
+
+The engine was evaluated through automated test suites and three benchmark repository archetypes.
+
+![SecretGuard Dashboard](docs/fig4_frontend_dashboard.png)
+
+### Automated Test Suite Coverage
+
+The automated test suite (`tests/test_engine.py`) consists of 37 unit and integration test cases across all engine modules, executing with a 100% pass rate:
+
+| Module Under Test | Test Cases | Passed | Pass Rate | Test Focus |
+| :--- | :---: | :---: | :---: | :--- |
+| Regex Pattern Detector | 5 | 5 | 100% | Pattern detection across AWS, Google, GitHub, JWT, DB URIs |
+| Entropy Analyzer | 3 | 3 | 100% | Shannon entropy across Hex, Base64, and ASCII sequences |
+| Context Filter | 2 | 2 | 100% | Placeholder suppression and test fixture detection |
+| Secret Reconstructor | 6 | 6 | 100% | Multi-part concat, f-strings, JS concat, status reporting |
+| Dataflow Tracker | 3 | 3 | 100% | Variable assignment, dictionary insertion, call argument tracking |
+| Exposure Sink Analyzer | 6 | 6 | 100% | Network requests, auth headers, logging sinks, multi-sink priority |
+| Risk Scoring Engine | 3 | 3 | 100% | Boundary validation, component summation, severity thresholds |
+| Defensive Masking & Dedup | 2 | 2 | 100% | Deterministic secret masking and duplicate finding consolidation |
+| End-to-End Pipeline & Ablation | 7 | 7 | 100% | Fragmented discovery, baseline comparison, safe filtering |
+| **Total Test Suite** | **37** | **37** | **100%** | Deterministic pipeline validation |
+
+### Benchmark Repository Evaluation
+
+| Repository Archetype | Files | Lines | Candidates | Confirmed Findings | Reconstructed Secrets | Average Risk | Severity Distribution |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Safe Repository** (`clean_code.py`) | 1 | 50 | 0 | 0 | 0 | 0.0 (Clean) | 0 Critical, 0 High, 0 Medium, 0 Low |
+| **Vulnerable Repository** (`hardcoded_secrets.py`) | 1 | 35 | 17 | 8 | 0 | 52.4 (Medium) | 2 Critical, 0 High, 6 Medium, 0 Low |
+| **Fragmented Repository** (`example.py`, `api_client.js`) | 2 | 102 | 14 | 10 | 5 | 68.6 (High) | 3 Critical, 3 High, 4 Medium, 0 Low |
+
+### Internal Baseline vs. Proposed Approach
+
+An ablation comparison was conducted against an internal literal-detection baseline (`Regex + Shannon Entropy only` via `/scan/baseline`):
+
+| Capability / Metric | Internal Literal Baseline | SecretGuard (Full Pipeline) | Result |
+| :--- | :--- | :--- | :--- |
+| Contiguous Literal Secrets | Detected (all 8 found) | Detected (all 8 found) | Parity on monolithic literals |
+| Fragmented Credentials | 0 detected | 5 reconstructed (`FULL`/`PARTIAL`) | Recovers split credentials |
+| Benign Concat Suppression | Flags raw strings | Pre-validation suppresses benign operations | 0 false alarms on clean repo |
+| Dataflow Tracking | Not supported | Directed propagation DAG | Full variable lineage traced |
+| Exposure Sink Mapping | Not supported | Classified by priority hierarchy | Differentiates network vs. logs |
+| Risk Scoring | Flat binary alert | Continuous 0–100 explainable score | Context-calibrated risk |
+
+### Reconstructed Secret Inventory (Fragmented Benchmark)
+
+| Target Variable | Source File | Fragments | Status | Masked Value | Exposure Sink | Risk Score |
+| :--- | :--- | :---: | :---: | :--- | :--- | :---: |
+| `access_key` | `example.py` | 3 | FULL | `AKIA****************5678` | Local assignment (None) | 64.0 (High) |
+| `github_token` | `example.py` | 2 | FULL | `ghp_****************cdef` | Network Request (`requests.get`) | 89.0 (Critical) |
+| `connection_string` | `example.py` | 5 | FULL | `mong****************tion` | Local assignment (None) | 63.0 (High) |
+| `mixed_key` | `example.py` | 2 | PARTIAL | `pref********************` | Dynamic retrieval (None) | 39.0 (Medium) |
+| `apiKey` | `api_client.js` | 2 | FULL | `AIza****************6789` | Network Request (`axios.post`) | 86.0 (Critical) |
+
+---
+
+## Project Structure
 
 ```
-project-root/
-├── frontend/          # React + Vite dashboard
-├── backend/           # Node.js + Express API server
-├── detection-engine/  # Python detection engine
+SecretGuard/
+├── frontend/                     # React 18 + Vite dashboard
+│   ├── src/
+│   │   ├── components/           # Navigation, charts, propagation graphs
+│   │   ├── pages/                # Dashboard, Scan, Results, Findings, Reports
+│   │   └── services/             # Axios API client
+│   └── package.json
+├── backend/                      # Node.js + Express API server
+│   ├── src/
+│   │   ├── controllers/          # Scan, finding, report controllers
+│   │   ├── routes/               # Express REST routes
+│   │   ├── services/             # Ingestion, MongoDB, PDFKit, Gemini service
+│   │   └── server.js
+│   └── package.json
+├── detection-engine/             # Python 3 static analysis engine
 │   ├── scanner/
-│   │   ├── file_scanner.py         # Recursive file discovery
-│   │   ├── regex_detector.py       # Pattern-based detection
-│   │   ├── entropy_analyzer.py     # Shannon entropy analysis
-│   │   ├── context_filter.py       # False positive reduction
-│   │   ├── secret_reconstructor.py # ⭐ Core novelty: fragment reconstruction
-│   │   ├── dataflow_tracker.py     # ⭐ Core novelty: propagation tracking
-│   │   ├── sink_analyzer.py        # ⭐ Core novelty: exposure identification
-│   │   ├── risk_engine.py          # Transparent risk scoring
-│   │   └── models.py              # Data models
-│   ├── main.py                    # FastAPI server
-│   └── tests/                     # Test suite
-├── sample-repositories/           # Synthetic test data
-├── reports/                       # Generated PDF reports
-└── docs/                          # Documentation
+│   │   ├── file_scanner.py       # Recursive file discovery and filtering
+│   │   ├── regex_detector.py     # 20+ credential pattern rules
+│   │   ├── entropy_analyzer.py   # Type-aware Shannon entropy analyzer
+│   │   ├── context_filter.py     # False-positive suppressor
+│   │   ├── secret_reconstructor.py # AST-based symbol table and fragment resolver
+│   │   ├── secret_validator.py   # Pre-finding statistical and env-var validator
+│   │   ├── dataflow_tracker.py   # Intra-procedural taint propagation tracker
+│   │   ├── sink_analyzer.py      # Prioritized exposure sink classifier
+│   │   ├── risk_engine.py        # 4-component continuous risk scoring
+│   │   ├── deduplicator.py       # Finding consolidation
+│   │   └── models.py             # Data models and structures
+│   ├── tests/
+│   │   └── test_engine.py        # Automated test suite (37 tests)
+│   ├── main.py                   # FastAPI service
+│   └── requirements.txt
+├── sample-repositories/          # Synthetic benchmark datasets
+│   ├── clean_code/               # Compliant repository archetype
+│   ├── hardcoded_secrets/        # Monolithic credential repository archetype
+│   └── fragmented_secret/        # Multi-fragment credential repository archetype
+├── docs/                         # System diagrams and technical specifications
+│   ├── fig1_architecture.png
+│   ├── fig2_reconstruction_workflow.png
+│   ├── fig3_detection_pipeline.png
+│   └── fig4_frontend_dashboard.png
+└── README.md
 ```
 
-## 🚀 Quick Start
+---
+
+## Installation and Setup
 
 ### Prerequisites
-- Python 3.9+
-- Node.js 18+
-- MongoDB (optional — falls back to in-memory storage)
 
-### 1. Detection Engine (Python)
+* Python 3.10+
+* Node.js 18+ LTS
+* MongoDB (optional; falls back automatically to in-memory store)
+
+### 1. Detection Engine Setup
+
 ```bash
 cd detection-engine
 python -m venv venv
-# Windows: venv\Scripts\activate
-# Linux/Mac: source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
+# Linux / macOS
+source venv/bin/activate
+
 pip install -r requirements.txt
 python main.py
-# Runs on http://localhost:8000
+```
+The detection service starts at `http://localhost:8000`.
+
+To run the automated test suite:
+```bash
+pytest tests/ -v
 ```
 
-### 2. Backend (Node.js)
+### 2. Backend Gateway Setup
+
 ```bash
 cd backend
-cp .env.example .env
-# Edit .env with your GEMINI_API_KEY (optional)
 npm install
-npm run dev
-# Runs on http://localhost:5000
-```
 
-### 3. Frontend (React)
+# Configure environment variables
+cp .env.example .env
+npm run dev
+```
+The gateway starts at `http://localhost:5000`.
+
+### 3. Frontend Dashboard Setup
+
 ```bash
 cd frontend
 npm install
 npm run dev
-# Runs on http://localhost:3000
 ```
-
-### 4. Open Dashboard
-Navigate to **http://localhost:3000**
+The client starts at `http://localhost:3000`.
 
 ---
 
-## 🔑 Environment Variables
+## Environment Configuration
 
-### Backend (.env)
-```
+### Backend (`backend/.env`)
+
+```ini
 PORT=5000
-MONGODB_URI=mongodb://localhost:27017/secret-detector
-GEMINI_API_KEY=           # Optional — AI analysis unavailable without this
+MONGODB_URI=mongodb://localhost:27017/secretguard
 PYTHON_ENGINE_URL=http://localhost:8000
+GEMINI_API_KEY=your_gemini_api_key_here # Optional: advisory recommendations
 MAX_UPLOAD_SIZE_MB=100
 ```
 
-### Frontend (.env)
-```
+### Frontend (`frontend/.env`)
+
+```ini
 VITE_API_URL=http://localhost:5000/api
 ```
 
-**Important:** Never commit actual API keys. The system works without Gemini.
+---
+
+## REST API Reference
+
+### Backend Gateway Endpoints (`http://localhost:5000`)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/health` | Service health status |
+| `POST` | `/api/scans` | Upload repository archive (ZIP) and initiate scan |
+| `GET` | `/api/scans` | List all past scan executions |
+| `GET` | `/api/scans/:id` | Fetch scan summary and status |
+| `GET` | `/api/scans/:id/findings` | Fetch all findings for a scan with filter support |
+| `GET` | `/api/findings/:id` | Fetch granular finding details, propagation path, and sink |
+| `POST` | `/api/findings/:id/ai-analysis` | Request post-detection Gemini remediation advice |
+| `GET` | `/api/reports/:scanId` | Generate and download formal PDF security report |
+
+### Python Engine Endpoints (`http://localhost:8000`)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Static analysis engine health check |
+| `POST` | `/scan` | Execute complete 8-stage analysis pipeline on target path |
+| `POST` | `/scan/baseline` | Execute literal baseline (Regex + Entropy only) for comparison |
 
 ---
 
-## 🎮 Demo Walkthrough
+## Defensive Security Invariants
 
-1. Open the dashboard at http://localhost:3000
-2. Click **New Scan**
-3. Upload the `sample-repositories/fragmented-secret/` as a ZIP
-4. Watch scan progress through 10 stages
-5. View findings with reconstruction evidence
-6. Click a finding to see the propagation path visualization
-7. Generate AI analysis (if Gemini configured)
-8. Download PDF report
+* **Deterministic Secret Masking:** Detected tokens are masked immediately (`mask_secret()`) displaying only prefix and suffix characters (`AKIA****************5678`). Raw secret strings are never logged or persisted.
+* **Advisory Isolation:** Complete secrets and source code files are never transmitted to external APIs. Only sanitized metadata (masked value, line number, sink type) is sent to Gemini.
+* **Zip-Slip Protection:** Archive decompression routines validate entry targets against destination root paths, rejecting directory traversal payloads (`../`).
+* **Non-Execution Invariant:** Source code is analyzed statically via syntax tree parsing. Uploaded code is never executed, compiled, or loaded into runtime interpreters.
 
 ---
 
-## 📊 Detection Pipeline
+## Current Scope and Limitations
 
-| Stage | Module | Purpose |
-|-------|--------|---------|
-| 1 | File Scanner | Recursive file discovery with language detection |
-| 2 | Regex Detector | Pattern matching for 20+ secret types |
-| 3 | Entropy Analyzer | Shannon entropy with context boosting |
-| 4 | Context Filter | False positive reduction (placeholders, docs, tests) |
-| 5 | **Secret Reconstructor** | ⭐ Fragment detection + constant propagation |
-| 6 | **Dataflow Tracker** | ⭐ Taint-based propagation tracking |
-| 7 | **Sink Analyzer** | ⭐ Exposure point identification + risk classification |
-| 8 | Risk Engine | Transparent 4-component scoring (0-100) |
-| 9 | Gemini AI | Explanation, impact, remediation (optional) |
+* **Intra-Procedural Scope:** Taint tracking operates within single source files; cross-file imports and module-level dataflows are not currently resolved.
+* **Control-Flow Sensitivity:** Static reconstruction resolves linear assignments and constant propagations; complex dynamic runtime conditions (e.g., conditional loops, polymorphic dynamic dispatch) are reported as `PARTIAL` or `UNRESOLVED`.
+* **Language Support:** Native AST-level constant propagation is implemented for Python, with grammar-based regex state tracking for JavaScript/TypeScript. Compiled languages currently use lexical pattern analysis.
 
 ---
 
-## 📈 Evaluation: Baseline vs Proposed
+## License
 
-| Metric | Baseline (Regex+Entropy) | Proposed (Full Pipeline) |
-|--------|--------------------------|--------------------------|
-| Fragmented secrets detected | 0 | ✅ Detected |
-| Secret reconstruction | ❌ Not supported | ✅ FULL/PARTIAL status |
-| Propagation tracking | ❌ Not supported | ✅ Graph-based |
-| Exposure sink identification | ❌ Not supported | ✅ Classified by risk |
-| Direct secrets detected | ✅ | ✅ |
+Copyright (c) 2026 Nayan Sharma. All rights reserved.
 
----
+This repository is published for educational, research, and demonstration
+purposes. The source code and associated materials are proprietary.
 
-## 🔒 Security Practices
+Viewing and forking this repository through GitHub are permitted for
+inspection and study. No permission is granted to copy, modify, redistribute,
+republish, sublicense, commercially exploit, or create derivative works from
+the source code without prior written permission from the author.
 
-- API keys from environment variables only
-- ZIP path traversal protection
-- File size limits
-- No uploaded code execution
-- Secrets masked in UI (e.g., `AKIA**********5678`)
-- Minimal data sent to Gemini (masked findings only)
-- CORS configuration
-- Rate limiting
-- Helmet security headers
+Attribution alone does not constitute permission to reuse the source code.
 
----
-
-## ⚠️ Limitations
-
-- Single-file analysis (no cross-file tracking)
-- Static analysis only (no runtime behavior)
-- Python AST parsing for Python files; regex fallback for other languages
-- Does not handle conditional assignments or complex control flow
-- Reports PARTIAL status when reconstruction is incomplete
-- Not a commercial-grade SAST tool
-
----
-
-## 🔮 Future Work
-
-- Cross-file dataflow tracking
-- Support for more languages with AST parsers
-- Inter-procedural analysis
-- CI/CD integration
-- Git history scanning
-- Custom rule creation UI
-- Enhanced visualizations
-
----
-
-## 📝 API Documentation
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/health` | GET | Health check |
-| `/api/scans` | POST | Upload ZIP and start scan |
-| `/api/scans` | GET | List all scans |
-| `/api/scans/:id` | GET | Get scan details |
-| `/api/scans/:id/findings` | GET | Get findings for a scan |
-| `/api/findings/:id` | GET | Get finding details |
-| `/api/findings/:id/ai-analysis` | POST | Generate AI explanation |
-| `/api/reports/:scanId` | GET | Download PDF report |
-
----
-
-## 📚 Technology Stack
-
-- **Frontend:** React 18, Vite, Recharts, Vanilla CSS
-- **Backend:** Node.js, Express, Multer, PDFKit
-- **Detection Engine:** Python 3, FastAPI, AST module
-- **AI:** Google Gemini API (optional)
-- **Database:** MongoDB with Mongoose (optional — in-memory fallback)
-
----
-
-*Built as an academic cybersecurity project demonstrating Program-Flow-Aware Secret Reconstruction and Exposure Analysis.*
+For permissions or collaboration inquiries, please contact:
+nayan.sharma172005@gmail.com

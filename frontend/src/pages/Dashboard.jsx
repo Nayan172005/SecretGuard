@@ -157,7 +157,7 @@ export default function Dashboard() {
         <div className="card-header">
           <span className="card-title">Recent Scans</span>
           <button className="btn btn-primary" onClick={() => navigate('/scan')}>
-            🔍 New Scan
+             New Scan
           </button>
         </div>
 
